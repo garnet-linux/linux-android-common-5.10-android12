@@ -1,5 +1,6 @@
-linux-android-5.10.247-android12-9-common-5.10-android12 (5.10.247) trixie; urgency=medium
+linux-android-5.10.247-android12-9-common-5.10-android12 (5.10.230+android12+9+droidian0+git20260921153643.6f3ab10.droidian) trixie; urgency=medium
 
-  * Remove control
+  * Update debian/changelog
 
- -- ximiyad123 <ximiyadka124@proton.me>  Mon, 21 Sep 2026 17:31:09 +0200
+ -- ximiyad123 <ximiyadka124@proton.me>  Mon, 21 Sep 2026 17:36:43 +0200
+
