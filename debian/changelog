@@ -1,6 +1,6 @@
-linux-android-5.10.230-android12-9-common-5.10-android12 (5.10.230+android12+9+droidian0+git20250117002556.4fdebb9.droidian) trixie; urgency=medium
+linux-android-5.10.230-android12-9-common-5.10-android12 (5.10.230+android12+9+droidian0+git20260921152100.b5b552c.droidian) trixie; urgency=medium
 
-  * [packaging] adapt to new kernel-info.mk
+  * Update android_kernel_common
 
- -- Alexander Rutz <alex@familyrutz.com>  Thu, 16 Jan 2025 17:25:56 -0700
+ -- ximiyad123 <ximiyadka124@proton.me>  Mon, 21 Sep 2026 17:21:00 +0200
 
