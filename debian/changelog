@@ -1,6 +1,5 @@
-linux-android-5.10.230-android12-9-common-5.10-android12 (5.10.230+android12+9+droidian0+git20260921152100.b5b552c.droidian) trixie; urgency=medium
+linux-android-5.10.247-android12-9-common-5.10-android12 (5.10.247) trixie; urgency=medium
 
-  * Update android_kernel_common
+  * Remove control
 
- -- ximiyad123 <ximiyadka124@proton.me>  Mon, 21 Sep 2026 17:21:00 +0200
-
+ -- ximiyad123 <ximiyadka124@proton.me>  Mon, 21 Sep 2026 17:31:09 +0200
