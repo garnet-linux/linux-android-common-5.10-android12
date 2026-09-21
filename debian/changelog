@@ -1,0 +1,6 @@
+linux-android-5.10.230-android12-9-common-5.10-android12 (5.10.230+android12+9+droidian0+git20250117002556.4fdebb9.droidian) trixie; urgency=medium
+
+  * [packaging] adapt to new kernel-info.mk
+
+ -- Alexander Rutz <alex@familyrutz.com>  Thu, 16 Jan 2025 17:25:56 -0700
+

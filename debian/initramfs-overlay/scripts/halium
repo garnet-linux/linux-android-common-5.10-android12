@@ -1,0 +1,1591 @@
+# Local filesystem mounting			-*- shell-script -*-
+
+if [ -e "/scripts/halium-hooks" ]; then
+	source /scripts/halium-hooks
+	WITH_HOOKS="yes"
+else
+	WITH_HOOKS="no"
+fi
+
+_log_msg() {
+	if [ "$quiet" = "y" ]; then
+		return
+	fi
+
+	printf "$@" > /dev/kmsg || true
+}
+
+pre_mountroot() {
+	[ "$quiet" != "y" ] && log_begin_msg "Running /scripts/local-top"
+	run_scripts /scripts/local-top
+	[ "$quiet" != "y" ] && log_end_msg
+}
+
+tell_kmsg() {
+	# Echos a string into /dev/kmsg, ignoring errors.
+	echo "initrd: $1" >/dev/kmsg || true
+}
+
+halium_panic() {
+	# Puts panic reason into kmsg and then starts the panic handlers.
+	REASON="$1"
+	tell_kmsg "PANIC for reason: $REASON"
+	panic $REASON
+}
+
+halium_hook() {
+	# Allows calling an user-defined hook.
+	#
+	# Hooks must go in /scripts/halium-hooks.
+	#
+	# Example:
+	#     halium_hook test
+	#
+	# This calls halium_hook_test() if it exists.
+
+	func="halium_hook_${1}"
+	shift
+
+	if [ "${WITH_HOOKS}" == "yes" ] &&
+		[ "$(type -t ${func})" == "${func}" ]; then
+		${func} ${@}
+	fi
+}
+
+droidian_minienv() {
+	# Executes the command preferring the minienv libraries.
+
+	executable="$(which ${1})"
+	shift
+
+	/minienv/lib/droidian-minienv-linker.so \
+		--inhibit-cache \
+		--library-path '/minienv/usr/${LIB}:/minienv/${LIB}:/usr/${LIB}:/${LIB}' \
+		${executable} ${@}
+}
+
+identify_boot_mode() {
+	# Our current list of supported boot modes:
+	#
+	# BOOT_MODE = halium and android
+
+	BOOT_MODE='halium'
+
+	# The boot reason is exported via /proc/cmdline.
+	# The standard method is using androidboot.mode.
+
+	for x in $(cat /proc/cmdline); do
+		case ${x} in
+		androidboot.mode=*)
+			android_bootmode=${x#*=}
+			;;
+
+		# Android 9 system-as-root
+		skip_initramfs)
+			normal_boot="y"
+			;;
+
+		# Android 10+ recovery-as-boot
+		androidboot.force_normal_boot=1)
+			normal_boot="y"
+			;;
+
+		# Android 12+ GKI 2.0+ recovery-as-boot
+		bootconfig)
+			if grep -q 'androidboot.force_normal_boot = "1"' /proc/bootconfig; then
+				normal_boot="y"
+			fi
+			;;
+		esac
+	done
+
+	if echo "$android_bootmode" | grep charger; then
+		BOOT_MODE="android"
+	fi
+
+	## Some devices may be using 'bootreason', others 'boot_reason'
+	## XXX: Find a better way to handle device specifics here
+
+	# Krillin
+	if [ -f /sys/class/BOOT/BOOT/boot/boot_mode ]; then
+		boot_reason=$(cat /sys/class/BOOT/BOOT/boot/boot_mode)
+
+		case "${boot_reason}" in
+		1)
+			BOOT_MODE="android"
+			;;
+
+		4)
+			BOOT_MODE="android"
+			;;
+
+		8)
+			BOOT_MODE="android"
+			;;
+
+		9)
+			BOOT_MODE="android"
+			;;
+		esac
+	fi
+
+	# System-as-root or a device without dedicated recovery partition.
+	if [ -f /ramdisk-recovery.img ] && [ -z "$normal_boot" ]; then
+		BOOT_MODE="recovery"
+	fi
+
+	# On Android 8+ devices the 'android' boot mode is broken and should
+	# be avoided.
+	#
+	# This behavior can be overridden with:
+	#
+	#     halium_no_avoid_android_mode
+	#
+	# on the kernel command line.
+
+	if ! grep -wq halium_no_avoid_android_mode /proc/cmdline; then
+		api_level=$(
+			sed -n 's/^ro.build.version.sdk=//p' \
+				/android-system/build.prop
+		)
+
+		[ -z "$api_level" ] && api_level=0
+
+		tell_kmsg "Android system image API level is $api_level"
+
+		if [ "$BOOT_MODE" = "android" ] && [ $api_level -ge 26 ]; then
+			tell_kmsg "Android 8+ device detected! Rebooting to reset non-standard boot mode..."
+			reboot -f
+		fi
+	fi
+
+	tell_kmsg "boot mode: $BOOT_MODE"
+}
+
+identify_android_image() {
+	# Determine whether the Android image is:
+	#
+	#   system.img
+	#       mounted as Android /system
+	#
+	#   android-rootfs.img
+	#       mounted as Android /
+	#
+	# Sets:
+	#
+	#   ANDROID_IMAGE_MODE=system
+	#   ANDROID_IMAGE_MODE=rootfs
+	#   ANDROID_IMAGE_MODE=unknown
+	#
+	# ANDROID_IMAGE contains the actual image path.
+
+	SYSTEM_SEARCH_PATHS="/halium-system/var/lib/lxc/android/system.img"
+
+	if [ "${file_layout}" == "halium" ]; then
+		SYSTEM_SEARCH_PATHS="/tmpmnt/system.img ${SYSTEM_SEARCH_PATHS}"
+	fi
+
+	ROOTFS_SEARCH_PATHS="/halium-system/var/lib/lxc/android/android-rootfs.img"
+
+	if [ "${file_layout}" == "halium" ]; then
+		ROOTFS_SEARCH_PATHS="/tmpmnt/android-rootfs.img ${ROOTFS_SEARCH_PATHS}"
+	fi
+
+	for image in ${SYSTEM_SEARCH_PATHS}; do
+		if [ -f "${image}" ]; then
+			ANDROID_IMAGE_MODE="system"
+			ANDROID_IMAGE="${image}"
+			return
+		fi
+	done
+
+	for image in ${ROOTFS_SEARCH_PATHS}; do
+		if [ -f "${image}" ]; then
+			ANDROID_IMAGE_MODE="rootfs"
+			ANDROID_IMAGE="${image}"
+			return
+		fi
+	done
+
+	ANDROID_IMAGE_MODE="unknown"
+}
+
+set_halium_version_properties() {
+	halium_system=$1
+	android_data=$2
+
+	channel_ini=$1/etc/system-image/channel.ini
+	def_language=$1/custom/default_language
+
+	halium="unknown"
+	device="unknown"
+	custom="unknown"
+	version="unknown"
+	channel="unknown"
+	def_lang="unknown"
+
+	if [ -f "$channel_ini" ]; then
+		IFS=','
+
+		for i in $(grep version_detail "$channel_ini" | awk -F ' ' '{print $2}'); do
+			id=${i%=*}
+
+			case $id in
+			halium)
+				halium=${i#halium=}
+				;;
+
+			device)
+				device=${i#device=}
+				;;
+
+			custom)
+				custom=${i#custom=}
+				;;
+
+			version)
+				version=${i#version=}
+				;;
+			esac
+		done
+
+		unset IFS
+
+		channel=$(grep channel "$channel_ini" | awk -F ' ' '{print $2}')
+	fi
+
+	if [ -f "$def_language" ]; then
+		lang=$(cat "$def_language")
+
+		if [ -n "$lang" ]; then
+			def_lang=$lang
+		fi
+	fi
+
+	# Write down so the Android property system can load them automatically.
+	mkdir -p "$android_data/property"
+	chmod 700 "$android_data/property"
+
+	echo -n "$halium" >"$android_data/property/persist.halium.version.rootfs"
+	echo -n "$device" >"$android_data/property/persist.halium.version.device"
+	echo -n "$custom" >"$android_data/property/persist.halium.version.custom"
+	echo -n "$channel" >"$android_data/property/persist.halium.version.channel"
+	echo -n "$version" >"$android_data/property/persist.halium.version"
+	echo -n "$def_lang" >"$android_data/property/persist.halium.default_language"
+
+	chmod 600 "$android_data/property/persist.halium.version.rootfs"
+	chmod 600 "$android_data/property/persist.halium.version.device"
+	chmod 600 "$android_data/property/persist.halium.version.custom"
+	chmod 600 "$android_data/property/persist.halium.version.channel"
+	chmod 600 "$android_data/property/persist.halium.version"
+	chmod 600 "$android_data/property/persist.halium.default_language"
+}
+
+mount_android_partitions() {
+	fstab=$1
+	mount_root=$2
+	real_userdata=$3
+
+	tell_kmsg "checking fstab $fstab for additional mount points"
+
+	# On GKI 2.0+ devices, the current slot is provided via bootconfig.
+	if [ -f /proc/bootconfig ]; then
+		ab_slot_suffix=$(
+			sed -n \
+				's/^androidboot\.slot_suffix = "\(.*\)"/\1/p' \
+				/proc/bootconfig |
+			tail -1
+		)
+	else
+		# Fallback for older Android versions.
+		ab_slot_suffix=$(
+			grep -o 'androidboot\.slot_suffix=..' /proc/cmdline |
+			tail -1 |
+			cut -d "=" -f2
+		)
+	fi
+
+	[ -n "$ab_slot_suffix" ] &&
+		tell_kmsg "A/B slot system detected! Slot suffix is $ab_slot_suffix"
+
+	cat ${fstab} | while read line; do
+		set -- $line
+
+		# Stop processing at #endhalium.
+		echo $1 | egrep -q "^#endhalium" && break
+
+		# Skip comments.
+		echo $1 | egrep -q "^#" && continue
+
+		# Skip invalid entries.
+		([ -z "$1" ] ||
+		 [ -z "$2" ] ||
+		 [ -z "$3" ] ||
+		 [ -z "$4" ]) && continue
+
+		# These are handled specially.
+		([ "$2" = "/system" ] ||
+		 [ "$2" = "/data" ] ||
+		 [ "$2" = "/" ]) && continue
+
+		label=$(echo $1 | awk -F/ '{print $NF}')
+		[ -z "$label" ] && continue
+
+		tell_kmsg "checking mount label $label"
+
+		# In case fstab provides /dev/mmcblk0p* lines.
+		path="/dev/$label"
+
+		for dir in \
+			by-partlabel \
+			by-name \
+			by-label \
+			by-path \
+			by-uuid \
+			by-partuuid \
+			by-id
+		do
+			if [ -e "/dev/disk/$dir/$label$ab_slot_suffix" ]; then
+				path="/dev/disk/$dir/$label$ab_slot_suffix"
+				break
+			elif [ -e "/dev/disk/$dir/$label" ]; then
+				path="/dev/disk/$dir/$label"
+				break
+			fi
+		done
+
+		[ ! -e "$path" ] && continue
+
+		mkdir -p "${mount_root}/$2"
+
+		tell_kmsg "mounting $path as ${mount_root}/$2"
+
+		mount "$path" "${mount_root}/$2" -t "$3" -o "$4"
+	done
+
+	# Provide a bind mount from /cache to /userdata/cache on systems
+	# without a dedicated cache partition.
+	if [ ! -e "${mount_root}/cache" ] ||
+		! grep -q "${mount_root}/cache" /proc/mounts
+	then
+		if [ ! -d "${real_userdata}/cache" ]; then
+			mkdir "${real_userdata}/cache"
+		fi
+
+		mkdir "${mount_root}/cache"
+
+		mount -o bind \
+			"${real_userdata}/cache" \
+			"${mount_root}/cache"
+	fi
+
+	# Create an appropriate symlink for vendor files.
+	if [ ! -e "${mount_root}/vendor" ]; then
+		ln -sf system/vendor "${mount_root}/vendor"
+	fi
+}
+
+mount_halium_overlay() {
+	source=$1
+	target=$2
+
+	if [ -d "${source}" ]; then
+		OLD_PWD=$PWD
+		cd "${source}"
+
+		for overlay in $(find . -type f); do
+			[ -f "${target}/${overlay}" ] &&
+				mount --bind \
+					"${source}/${overlay}" \
+					"${target}/${overlay}"
+		done
+
+		cd "$OLD_PWD"
+	fi
+}
+
+sync_dirs() {
+	base=$1
+	source=$2
+	target=$3
+
+	OLD_PWD=$PWD
+	cd "$base"
+
+	for file in $source/*; do
+		# Skip empty directories.
+		[ ! -e "$base/$file" ] &&
+			[ ! -L "$base/$file" ] &&
+			continue
+
+		# If target already exists as a file/link, do nothing.
+		[ -e "$target/$file" -o -L "$target/$file" ] &&
+			[ ! -d "$target/$file" ] &&
+			continue
+
+		# If target doesn't exist, copy it.
+		if [ ! -e "$target/$file" ] &&
+			[ ! -L "$target/$file" ]
+		then
+			cp -Ra "$base/$file" "$target/$file"
+			continue
+		fi
+
+		# Otherwise recursively process directories.
+		[ -d "$file" ] &&
+			sync_dirs "$base" "$file" "$target"
+	done
+
+	cd "$OLD_PWD"
+}
+
+resize_userdata_if_needed() {
+	# See if the filesystem on userdata needs resizing.
+
+	path=$1
+
+	# Partition size in 1k blocks.
+	case $path in
+	/dev/mmcblk*)
+		pblocks=$(grep ${path#/dev/*} /proc/partitions | awk {'print $3'})
+		;;
+
+	/dev/disk*)
+		pblocks=$(
+			grep \
+				$(basename $(readlink "$path")) \
+				/proc/partitions |
+			awk {'print $3'}
+		)
+		;;
+	esac
+
+	# Filesystem size in 4k blocks.
+	fsblocks=$(
+		dumpe2fs -h "$path" |
+		grep "Block count" |
+		awk {'print $3'}
+	)
+
+	# Difference in 1k blocks.
+	dblocks=$((pblocks - 4 * fsblocks))
+
+	if [ $dblocks -gt 10000 ]; then
+		resize2fs -f "$path"
+		tell_kmsg "resized userdata filesystem to fill $path"
+	fi
+}
+
+resize_lvm_if_needed() {
+	# Resize Droidian LVM root filesystem if required.
+
+	pv=${1}
+	vg=${2}
+	lv=${3}
+
+	if [ ! -e "/halium-system/var/lib/halium/requires-lvm-resize" ]; then
+		return
+	fi
+
+	part="/dev/${vg}/${lv}"
+
+	# Resize physical volume.
+	if ! lvm pvresize "${pv}"; then
+		tell_kmsg "Unable to resize PV ${pv}"
+		return
+	fi
+
+	# Resize rootfs LV.
+	if ! lvm lvresize -l +100%FREE "${part}"; then
+		tell_kmsg "Unable to resize LV ${lv}"
+		return
+	fi
+
+	# Resize filesystem.
+	if [ "$(blkid "${part}" -o value -s TYPE)" == "ext4" ]; then
+		e2fsck -fy "${part}"
+
+		if ! resize2fs -f "${part}"; then
+			tell_kmsg "Unable to resize ext4 partition ${part}"
+			return
+		fi
+	else
+		tell_kmsg "Unsupported filesystem on ${part}"
+	fi
+
+	rm -f /halium-system/var/lib/halium/requires-lvm-resize
+}
+
+identify_file_layout() {
+	# Determine the rootfs layout.
+
+	# "halium":
+	#   separate rootfs.img and system.img on userdata
+	#
+	# "partition":
+	#   rootfs on the system partition
+	#
+	# "subdir":
+	#   rootfs in a userdata directory
+
+	if [ -e /tmpmnt/rootfs.img ]; then
+		imagefile=/tmpmnt/rootfs.img
+		file_layout="halium"
+
+	elif [ -e /tmpmnt/ubuntu.img ]; then
+		imagefile=/tmpmnt/ubuntu.img
+		file_layout="legacy"
+
+	elif [ -d /tmpmnt/halium-rootfs ]; then
+		imagefile=/tmpmnt/halium-rootfs
+		file_layout="subdir"
+
+	else
+		file_layout="partition"
+	fi
+}
+
+process_bind_mounts() {
+	if [ ! -e "${rootmnt}/etc/system-image/writable-paths" ]; then
+		tell_kmsg "This rootfs does not have any writable-paths defined"
+		return 0
+	fi
+
+	# Mount tmpfs in /run of rootfs.
+	mount -o \
+		rw,nosuid,noexec,relatime,mode=755 \
+		-t tmpfs \
+		tmpfs \
+		"${rootmnt}/run"
+
+	FSTAB="${rootmnt}/etc/fstab"
+
+	touch "${rootmnt}/run/image.fstab"
+
+	mount -o bind \
+		"${rootmnt}/run/image.fstab" \
+		"$FSTAB" ||
+		halium_panic "Could not bind-mount fstab"
+
+	echo "/dev/root / rootfs defaults,ro 0 0" >>"$FSTAB"
+
+	tell_kmsg "Adding bind-mounts to $FSTAB"
+
+	cat "${rootmnt}/etc/system-image/writable-paths" |
+	while read line; do
+		set -- $line
+
+		# Skip invalid/commented entries.
+		([ -z "$1" ] ||
+		 [ -z "$2" ] ||
+		 [ -z "$3" ] ||
+		 [ -z "$4" ] ||
+		 [ -z "$5" ]) && continue
+
+		[ "$1" = "#" ] && continue
+
+		dstpath="${rootmnt}/$1"
+
+		[ ! -e "$dstpath" ] && continue
+
+		if [ "$3" = "temporary" ]; then
+			echo "tmpfs $1 tmpfs $5 0 0" >>"$FSTAB"
+
+		elif [ "$3" = "persistent" ] ||
+			[ "$3" = "synced" ]
+		then
+			if [ "$2" = "auto" ]; then
+				srcpath="${rootmnt}/userdata/system-data/$1"
+				path="/userdata/system-data/$1"
+			else
+				srcpath="${rootmnt}/userdata/$2"
+				path="/userdata/$2"
+			fi
+
+			if [ ! -e "$srcpath" ]; then
+				dstown=$(stat -c "%u:%g" "$dstpath")
+				dstmode=$(stat -c "%a" "$dstpath")
+
+				mkdir -p "${srcpath%/*}"
+
+				if [ ! -d "$dstpath" ]; then
+					if [ "$4" = "transition" ]; then
+						cp -a "$dstpath" "$srcpath"
+					else
+						touch "$srcpath"
+						chown "$dstown" "$srcpath"
+						chmod "$dstmode" "$srcpath"
+					fi
+				else
+					if [ "$4" = "transition" ] ||
+						[ "$3" = "synced" ]
+					then
+						cp -aR "$dstpath" "$srcpath"
+					else
+						mkdir "$srcpath"
+						chown "$dstown" "$srcpath"
+						chmod "$dstmode" "$srcpath"
+					fi
+				fi
+
+			elif [ "$3" = "synced" ]; then
+				sync_dirs "$dstpath" . "$srcpath"
+			fi
+
+			if [ "$5" = "none" ]; then
+				mount_opts="bind"
+			else
+				mount_opts="bind,$5"
+			fi
+
+			case "$1" in
+			/etc/*)
+				mount -o "$mount_opts" \
+					"$srcpath" \
+					"$dstpath"
+				;;
+
+			*)
+				echo "$path $1 none $mount_opts 0 0" >>"$FSTAB"
+				;;
+			esac
+
+		else
+			continue
+		fi
+	done
+}
+
+extract_android_ramdisk() {
+	# Extract Android ramdisk from Android system image.
+
+	tell_kmsg "extracting android ramdisk"
+
+	OLD_CWD=$(pwd)
+
+	mount -n -t tmpfs tmpfs /android-rootfs
+
+	cd /android-rootfs
+
+	cat /android-system/boot/android-ramdisk.img |
+		gzip -d |
+		cpio -i
+
+	cd "$OLD_CWD"
+}
+
+mount_kernel_modules() {
+	# Bind-mount /lib/modules from Android.
+
+	[ -e "${rootmnt}/android/system/lib/modules" ] &&
+		mount --bind \
+			"${rootmnt}/android/system/lib/modules" \
+			"${rootmnt}/lib/modules"
+}
+
+load_kernel_modules() {
+	# Ubuntu/Halium module loading implementation.
+	#
+	# This is intentionally used instead of Droidian's original
+	# flat-directory loader.
+
+	[ ! -d /lib/modules ] && return
+
+	kver=$(uname -r)
+
+	if [ ! -e "/lib/modules/${kver}" ]; then
+		# modprobe expects modules to be in a kernel release subfolder.
+		mv /lib/modules "/lib/${kver}"
+
+		mkdir /lib/modules
+
+		mv "/lib/${kver}" \
+			"/lib/modules/${kver}"
+	fi
+
+	tell_kmsg "Loading kernel modules from /lib/modules/${kver}"
+
+	# Convert modules.blocklist to modprobe.d blacklist.
+	mkdir -p /etc/modprobe.d
+
+	cat "/lib/modules/${kver}/modules.blocklist" |
+		sed -e 's/blocklist/blacklist/g' \
+		>> /etc/modprobe.d/blacklist.conf
+
+	# Prefer kmod over BusyBox implementations.
+	ln -sf /bin/kmod /sbin/depmod
+	ln -sf /bin/kmod /sbin/insmod
+
+	# Generate dependency information.
+	/sbin/depmod -a
+
+	# Use blacklist and verbose output.
+	export MODPROBE_OPTIONS="-vb"
+
+	cat "/lib/modules/${kver}/modules.load" |
+	while read line; do
+		set -- $line
+
+		# Skip comments.
+		[ "$1" = "#" ] && continue
+
+		modname=$(basename "$1" .ko)
+
+		tell_kmsg "Loading $modname"
+
+		/sbin/modprobe "$modname" > /dev/kmsg 2>&1
+	done
+}
+
+unlock_encrypted_partition() {
+	part="${1}"
+	header="${2}"
+	name="${3}"
+	is_recovery="${4}"
+
+	# FIXME: quit plymouth.
+	[ -e "/usr/bin/plymouth" ] &&
+		droidian_minienv plymouth quit ||
+		true
+
+	halium_hook setup_touchscreen
+
+	tries="0"
+
+	while [ "${1}" ]; do
+		CRYPTTAB_TRIED="${tries}" \
+			droidian_minienv unl0kr |
+		droidian_minienv droidian-encryption-helper \
+			--device "${part}" \
+			--header "${header}" \
+			--name "${name}" \
+			--rootmnt "${rootmnt}" \
+			--strip-newlines
+
+		err="${?}"
+
+		case "${err}" in
+		2)
+			# Wrong passphrase.
+			let tries=tries+1
+
+			if [ "${is_recovery}" == "yes" ] &&
+				[ "${tries}" > 5 ]
+			then
+				halium_panic "Unable to unlock root partition"
+			fi
+			;;
+
+		0)
+			if [ ! -e "/dev/mapper/${name}" ]; then
+				halium_panic \
+					"Root partition unlocked, but device has not been mapped"
+			fi
+
+			break
+			;;
+
+		*)
+			halium_panic \
+				"Unknown error ${err} while unlocking root partition"
+			break
+			;;
+		esac
+	done
+
+	halium_hook teardown_touchscreen
+}
+
+signal_root_move_done() {
+	# Signal to droidian-encryption-helper that root move is complete.
+
+	[ -e /run/droidian-encryption-helper.pid ] || return
+
+	touch /run/halium-mounted
+
+	count=0
+
+	while [ -e /run/halium-mounted ] &&
+		[ ${count} -lt 20 ]
+	do
+		sleep 1
+		let count=count+1
+	done
+}
+
+mount_vendor_partitions() {
+	# Mount Android vendor and vendor_dlkm.
+	#
+	# This is Droidian-specific and is intentionally retained.
+
+	mkdir /vendor
+	mkdir /vendor_dlkm
+
+	if [ -e "/dev/disk/by-partlabel/super" ]; then
+		tell_kmsg "mapping super partition"
+
+		losetup -r \
+			/dev/loop0 \
+			/dev/disk/by-partlabel/super
+
+		/minienv/lib/droidian-minienv-linker.so \
+			--inhibit-cache \
+			--library-path \
+			'/minienv/usr/${LIB}:/minienv/${LIB}:/usr/${LIB}:/${LIB}' \
+			/usr/sbin/dmsetup create --concise \
+			"$(droidian_minienv \
+				/usr/sbin/parse-android-dynparts \
+				/dev/loop0)"
+	fi
+
+	vendor_images="
+		/tmpmnt/vendor.img
+		/dev/disk/by-partlabel/vendor${1}
+		/dev/disk/by-partlabel/vendor_a
+		/dev/disk/by-partlabel/vendor_b
+		/dev/mapper/dynpart-vendor
+		/dev/mapper/dynpart-vendor${1}
+		/dev/mapper/dynpart-vendor_a
+		/dev/mapper/dynpart-vendor_b
+	"
+
+	for image in $vendor_images; do
+		if [ -e "$image" ]; then
+			tell_kmsg "mounting vendor from $image"
+
+			mount "$image" /vendor -o ro
+
+			if [ -e "/vendor/build.prop" ]; then
+				tell_kmsg "found valid vendor partition: $image"
+				break
+			else
+				tell_kmsg "$image is not a valid vendor partition"
+				umount /vendor
+			fi
+		fi
+	done
+
+	vendor_dlkm_images="
+		/dev/mapper/dynpart-vendor_dlkm
+		/dev/mapper/dynpart-vendor_dlkm${1}
+		/dev/mapper/dynpart-vendor_dlkm_a
+		/dev/mapper/dynpart-vendor_dlkm_b
+	"
+
+	for image in $vendor_dlkm_images; do
+		if [ -e "$image" ]; then
+			tell_kmsg "mounting vendor_dlkm from $image"
+
+			mount "$image" /vendor_dlkm -o ro
+
+			if [ -e "/vendor_dlkm/etc/build.prop" ]; then
+				tell_kmsg "found valid vendor_dlkm partition: $image"
+				break
+			else
+				tell_kmsg "$image is not a valid vendor_dlkm partition"
+				umount /vendor_dlkm
+			fi
+		fi
+	done
+}
+
+mountroot() {
+	# List of possible userdata partition names.
+	partlist="userdata UDA DATAFS USERDATA"
+
+	pre_mountroot
+
+	[ "$quiet" != "y" ] &&
+		log_begin_msg "Running /scripts/local-premount"
+
+	run_scripts /scripts/local-premount
+
+	[ "$quiet" != "y" ] &&
+		log_end_msg
+
+	# Put all script output into /dev/kmsg.
+	exec &>/dev/kmsg
+
+	#
+	# Load kernel modules FIRST.
+	#
+	# This intentionally follows Ubuntu's Halium sequence.
+	#
+	load_kernel_modules
+
+	tell_kmsg "Finished loading kernel modules"
+
+	sleep 1
+
+	# Create temporary mountpoint.
+	mkdir -p /tmpmnt
+
+	# Wait for udev.
+	udevadm settle
+
+	# Find userdata partition.
+	for partname in $partlist; do
+		part=$(find /dev -name "$partname" | tail -1)
+
+		[ -z "$part" ] && continue
+
+		path=$(readlink -f "$part")
+
+		[ -n "$path" ] && break
+	done
+
+	#
+	# Determine A/B slot.
+	#
+	if [ -e /proc/bootconfig ]; then
+		ab_slot_suffix=$(
+			grep -o \
+				'androidboot\.slot_suffix = ".."' \
+				/proc/bootconfig |
+			cut -d '"' -f2
+		)
+	fi
+
+	if [ -z "$ab_slot_suffix" ]; then
+		ab_slot_suffix=$(
+			grep -o \
+				'androidboot\.slot_suffix=..' \
+				/proc/cmdline |
+			cut -d "=" -f2
+		)
+	fi
+
+	if [ -z "$path" ] &&
+		[ -n "$ab_slot_suffix" ]
+	then
+		tell_kmsg \
+			"Searching for A/B data partition on slot $ab_slot_suffix."
+
+		for partname in $partlist; do
+			part=$(find /dev -name "$partname$ab_slot_suffix" | tail -1)
+
+			[ -z "$part" ] && continue
+
+			path=$(readlink -f "$part")
+
+			[ -n "$path" ] && break
+		done
+	fi
+
+	#
+	# Droidian datapart= override.
+	#
+	if grep -q datapart= /proc/cmdline; then
+		for x in $(cat /proc/cmdline); do
+			case ${x} in
+			datapart=*)
+				path=${x#*=}
+				;;
+			esac
+		done
+	fi
+
+	if [ -z "$path" ]; then
+		halium_panic "Couldn't find data partition."
+	fi
+
+	#
+	# Determine whether this is a Halium recovery boot.
+	#
+	if grep -q halium.recovery /proc/cmdline; then
+		HALIUM_RECOVERY="yes"
+
+		for x in $(cat /proc/cmdline); do
+			case ${x} in
+			skip_initramfs|androidboot.force_normal_boot=1)
+				HALIUM_RECOVERY="no"
+				;;
+			esac
+		done
+	else
+		HALIUM_RECOVERY="no"
+	fi
+
+	#
+	# Droidian-specific vendor setup.
+	#
+	# This happens after userdata/device discovery but before
+	# the Droidian root/LVM setup.
+	#
+	mount_vendor_partitions "$ab_slot_suffix"
+
+	#
+	# Droidian LVM configuration.
+	#
+	use_lvm="yes"
+
+	if grep -q droidian.lvm /proc/cmdline; then
+		for x in $(cat /proc/cmdline); do
+			case ${x} in
+			droidian.lvm.disable)
+				use_lvm="no"
+				;;
+
+			droidian.lvm.vg=*)
+				search_vg=${x#*=}
+				;;
+
+			droidian.lvm.root_lv=*)
+				root_lv=${x#*=}
+				;;
+
+			droidian.lvm.reserved_lv=*)
+				reserved_lv=${x#*=}
+				;;
+
+			droidian.lvm.persistent_lv=*)
+				persistent_lv=${x#*=}
+				;;
+			esac
+		done
+	fi
+
+	#
+	# Try Droidian LVM first.
+	#
+	if [ "${use_lvm}" == "yes" ]; then
+		[ -z "${search_vg}" ] &&
+			search_vg="droidian sailfish"
+
+		[ -z "${root_lv}" ] &&
+			root_lv="droidian-rootfs"
+
+		[ -z "${reserved_lv}" ] &&
+			reserved_lv="droidian-reserved"
+
+		[ -z "${persistent_lv}" ] &&
+			persistent_lv="droidian-persistent"
+
+		for try in 1 2 3 4 5; do
+			lvm vgscan --mknodes
+
+			for vg in ${search_vg}; do
+				if lvm vgchange -ay "${vg}" &&
+					[ -e "/dev/${vg}/${root_lv}" ]
+				then
+					tell_kmsg "Found LVM VG ${vg}"
+
+					_syspart="/dev/${vg}/${root_lv}"
+					file_layout="partition"
+
+					break
+				fi
+			done
+
+			[ -n "${_syspart}" ] && break
+
+			sleep 2
+		done
+
+		#
+		# If LVM wasn't found, fall back to normal Halium userdata.
+		#
+		if [ -z "${_syspart}" ]; then
+			unset use_lvm
+
+		elif [ -e "/dev/${vg}/${reserved_lv}" ] &&
+			[ "$(blkid /dev/${vg}/${reserved_lv} -o value -s TYPE)" == "crypto_LUKS" ]
+		then
+			unlocked_syspart_name="droidian_encrypted"
+			use_luks="yes"
+
+			unlock_encrypted_partition \
+				"/dev/${vg}/${root_lv}" \
+				"/dev/${vg}/${reserved_lv}" \
+				"${unlocked_syspart_name}" \
+				"${HALIUM_RECOVERY}"
+
+			_syspart="/dev/mapper/${unlocked_syspart_name}"
+		fi
+	fi
+
+	#
+	# Normal userdata-based Halium layout.
+	#
+	if [ "${use_lvm}" != "yes" ]; then
+		tell_kmsg "checking filesystem integrity for the userdata partition"
+
+		fsck_start=$(date +%s)
+
+		mount -o errors=remount-ro "$path" /tmpmnt
+		umount /tmpmnt
+
+		e2fsck -y "$path" >/run/e2fsck.out 2>&1
+
+		fsck_end=$(date +%s)
+
+		tell_kmsg \
+			"checking filesystem for userdata took (including e2fsck) $((fsck_end - fsck_start)) seconds"
+
+		resize_userdata_if_needed "$path"
+
+		tell_kmsg "mounting $path"
+
+		[ "$(blkid "$path" -o value -s TYPE)" = "ext4" ] &&
+			OPTIONS="data=journal,"
+
+		mount -o discard,$OPTIONS "$path" /tmpmnt
+
+		#
+		# systempart= override.
+		#
+		# If .ignore_systempart exists, ignore it.
+		#
+		if grep -q systempart= /proc/cmdline &&
+			[ ! -e /tmpmnt/.ignore_systempart ]
+		then
+			for x in $(cat /proc/cmdline); do
+				case ${x} in
+				systempart=*)
+					_syspart=${x#*=}
+					;;
+				esac
+			done
+		fi
+
+		identify_file_layout
+	fi
+
+	#
+	# If neither imagefile nor system partition was selected,
+	# use the normal Android dynamic system partition.
+	#
+	if [ -z "$imagefile" ] &&
+		[ -z "$_syspart" ]
+	then
+		_syspart=/dev/mapper/system
+	fi
+
+	#
+	# Add A/B suffix to system partition if necessary.
+	#
+	if [ -n "$_syspart" ] &&
+		[ ! -e "$_syspart" ]
+	then
+		[ -z "$ab_slot_suffix" ] &&
+			ab_slot_suffix=_a
+
+		tell_kmsg \
+			"A/B slot system detected! Slot suffix is $ab_slot_suffix"
+
+		_syspart="${_syspart}${ab_slot_suffix}"
+
+		tell_kmsg "system partition is at $_syspart"
+	fi
+
+	tell_kmsg "Halium rootfs is $imagefile $_syspart"
+
+	#
+	# Prepare root filesystem.
+	#
+	mkdir -p /halium-system
+
+	tell_kmsg "mounting system rootfs at /halium-system"
+
+	if [ -n "$_syspart" ]; then
+		mount -o rw "$_syspart" /halium-system
+
+		[ "${use_lvm}" == "yes" ] &&
+			resize_lvm_if_needed \
+				"${path}" \
+				"${vg}" \
+				"${root_lv}"
+
+	elif [ -f "$imagefile" ]; then
+		mount -o loop,rw "$imagefile" /halium-system
+
+	elif [ -d "$imagefile" ]; then
+		mount -o bind \
+			/tmpmnt/halium-rootfs \
+			/halium-system
+	fi
+
+	#
+	# Prepare Android mountpoints.
+	#
+	mkdir -p /android-rootfs
+	mkdir -p /android-system
+
+	identify_android_image
+
+	[ "$ANDROID_IMAGE_MODE" = "unknown" ] &&
+		tell_kmsg "WARNING: Android system image not found."
+
+	#
+	# Writable image handling.
+	#
+	if [ -e /tmpmnt/.writable_image ] ||
+		[ -e /halium-system/.writable_image ]
+	then
+		tell_kmsg \
+			"mounting $_syspart $imagefile (image developer mode)"
+
+		mountroot_status="$?"
+	else
+		tell_kmsg \
+			"mounting $_syspart $imagefile (user mode)"
+
+		mount -o remount,ro /halium-system
+
+		mountroot_status="$?"
+	fi
+
+	#
+	# Mount Android system image.
+	#
+	MOUNT="ro"
+	MOUNT_LOCATION="/android-$ANDROID_IMAGE_MODE"
+
+	if [ -e /tmpmnt/.writable_device_image ] ||
+		[ -e /halium-system/.writable_device_image ]
+	then
+		MOUNT="rw"
+	fi
+
+	tell_kmsg \
+		"mounting android system image ($ANDROID_IMAGE) $MOUNT, in $MOUNT_LOCATION ($ANDROID_IMAGE_MODE mode)"
+
+	if [ -n "${ANDROID_IMAGE}" ]; then
+		mount -o loop,$MOUNT \
+			"${ANDROID_IMAGE}" \
+			"${MOUNT_LOCATION}" ||
+			tell_kmsg "WARNING: Failed to mount Android system.img."
+	else
+		tell_kmsg \
+			"WARNING: Unable to mount Android system image as it hasn't been found."
+	fi
+
+	[ "$ANDROID_IMAGE_MODE" = "rootfs" ] &&
+		mount -o bind \
+			"${MOUNT_LOCATION}/system" \
+			/android-system
+
+	[ "$ANDROID_IMAGE_MODE" = "system" ] &&
+		extract_android_ramdisk
+
+	identify_boot_mode
+
+	#
+	# Recovery boot.
+	#
+	if [ "${HALIUM_RECOVERY}" == "yes" ]; then
+		halium_hook recovery_ready
+		halium_panic "Recovery mode ready"
+	fi
+
+	if [ "$BOOT_MODE" = "recovery" ]; then
+		tell_kmsg \
+			"Recovery boot mode for system-as-root devices"
+
+		umount -d \
+			/android-system \
+			/android-rootfs \
+			/halium-system \
+			/tmpmnt
+
+		dmsetup remove_all
+
+		mount -n -t tmpfs tmpfs "${rootmnt}"
+
+		cd "${rootmnt}"
+
+		if [ -d /lib/modules ]; then
+			mkdir -p lib/modules
+			mv /lib/modules/* lib/modules/
+		fi
+
+		cat /ramdisk-recovery.img |
+			gzip -d |
+			cpio -i
+
+		cd -
+
+		mkdir -p "${rootmnt}/sbin"
+
+		ln -s ../init "${rootmnt}/sbin/init"
+
+	elif ([ -e "$imagefile" ] || [ -n "$_syspart" ]) &&
+		[ "$BOOT_MODE" = "android" ]
+	then
+		#
+		# Android factory/charger boot.
+		#
+		tell_kmsg \
+			"Android boot mode for factory or charger mode"
+
+		mount --move \
+			/android-rootfs \
+			"${rootmnt}"
+
+		[ "$ANDROID_IMAGE_MODE" = "system" ] &&
+			mount --move \
+				/android-system \
+				"${rootmnt}/system"
+
+		[ "${use_luks}" == "yes" ] &&
+			signal_root_move_done
+
+		#
+		# Mount all Android partitions.
+		#
+		mount_android_partitions \
+			"${rootmnt}/fstab*" \
+			"${rootmnt}" \
+			/tmpmnt
+
+		mkdir -p "${rootmnt}/halium-system"
+
+		mount --move \
+			/halium-system \
+			"${rootmnt}/halium-system"
+
+		#
+		# Android userdata.
+		#
+		mkdir -p "${rootmnt}/data"
+		mkdir -p /tmpmnt/android-data
+
+		mount -o bind \
+			/tmpmnt/android-data \
+			"${rootmnt}/data"
+
+		set_halium_version_properties \
+			"${rootmnt}/halium-system" \
+			"${rootmnt}/data"
+
+		#
+		# Android init.
+		#
+		ln -s ../init "${rootmnt}/sbin/init"
+		ln -s ../init "${rootmnt}/sbin/recovery"
+
+		tell_kmsg "booting android..."
+
+	elif [ -e "$imagefile" ] ||
+		[ -n "$_syspart" ]
+	then
+		#
+		# Normal Droidian/Halium boot.
+		#
+		tell_kmsg "Normal boot"
+
+		mount --move \
+			/halium-system \
+			"${rootmnt}"
+
+		mkdir -p "${rootmnt}/android"
+
+		[ "${use_luks}" == "yes" ] &&
+			signal_root_move_done
+
+		#
+		# Mount userdata outside /android.
+		#
+		mkdir -p "${rootmnt}/userdata"
+
+		if [ "${use_lvm}" != "yes" ]; then
+			mount --move \
+				/tmpmnt \
+				"${rootmnt}/userdata"
+		fi
+
+		#
+		# Android rootfs.
+		#
+		mount --move \
+			/android-rootfs \
+			"${rootmnt}/var/lib/lxc/android/rootfs"
+
+		[ "$ANDROID_IMAGE_MODE" = "system" ] &&
+			mount -o rw,size=4096 \
+				-t tmpfs \
+				none \
+				"${rootmnt}/android"
+
+		[ "$ANDROID_IMAGE_MODE" = "rootfs" ] &&
+			mount -o bind \
+				"${rootmnt}/var/lib/lxc/android/rootfs" \
+				"${rootmnt}/android"
+
+		mkdir -p "${rootmnt}/android/data"
+		mkdir -p "${rootmnt}/android/system"
+
+		#
+		# Fake Android data shared by rootfs and LXC.
+		#
+		mkdir -p "${rootmnt}/userdata/android-data"
+
+		mount -o bind \
+			"${rootmnt}/userdata/android-data" \
+			"${rootmnt}/android/data"
+
+		[ ! -h "${rootmnt}/data" ] &&
+			ln -sf /android/data "${rootmnt}/data"
+
+		set_halium_version_properties \
+			"${rootmnt}" \
+			"${rootmnt}/userdata/android-data"
+
+		#
+		# Get Android device name.
+		#
+		device=$(
+			grep '^ro.product.device=' \
+				/android-system/build.prop |
+			sed -e 's/.*=//'
+		)
+
+		if [ -z "$device" ]; then
+			device="unknown"
+			tell_kmsg \
+				"WARNING: Didn't find a device name. Is the Android system image mounted correctly?"
+		fi
+
+		tell_kmsg "device is $device"
+
+		#
+		# Prepare writable paths.
+		#
+		process_bind_mounts
+
+		#
+		# Mount Android partitions from Android fstab.
+		#
+		mount_android_partitions \
+			"${rootmnt}/var/lib/lxc/android/rootfs/fstab*" \
+			"${rootmnt}/android" \
+			"${rootmnt}/userdata"
+
+		#
+		# Android system is special.
+		#
+		tell_kmsg "moving Android system to /android/system"
+
+		mount --move \
+			/android-system \
+			"${rootmnt}/android/system"
+
+		#
+		# Droidian-specific Android vendor.
+		#
+		if [ -e "/vendor/build.prop" ]; then
+			tell_kmsg \
+				"moving Android vendor to /android/vendor"
+
+			mkdir -p \
+				"${rootmnt}/android/vendor"
+
+			mount --move \
+				/vendor \
+				"${rootmnt}/android/vendor"
+		fi
+
+		#
+		# Droidian-specific vendor_dlkm.
+		#
+		if [ -e "/vendor_dlkm/etc/build.prop" ]; then
+			tell_kmsg \
+				"moving Android vendor_dlkm to /android/vendor_dlkm"
+
+			mkdir -p \
+				"${rootmnt}/android/vendor_dlkm"
+
+			mount --move \
+				/vendor_dlkm \
+				"${rootmnt}/android/vendor_dlkm"
+		fi
+
+		#
+		# Halium overlay.
+		#
+		if [ -e "${rootmnt}/android/system/halium" ]; then
+			mount_halium_overlay \
+				"${rootmnt}/android/system/halium" \
+				"${rootmnt}"
+		fi
+
+		#
+		# Device-specific udev rules.
+		#
+		if [ -e "${rootmnt}/usr/lib/lxc-android-config/70-${device}.rules" ] &&
+			[ ! -f "${rootmnt}/android/system/halium/lib/udev/rules.d/70-android.rules" ] &&
+			[ "$device" != "unknown" ]
+		then
+			mount --bind \
+				"${rootmnt}/usr/lib/lxc-android-config/70-${device}.rules" \
+				"${rootmnt}/lib/udev/rules.d/70-android.rules"
+		fi
+
+		#
+		# Make Android kernel modules available in the final root.
+		#
+		# NOTE:
+		# load_kernel_modules() already happened at the beginning
+		# of the initramfs.
+		#
+		mount_kernel_modules
+
+		#
+		# Bind-mount ureadahead if available.
+		#
+		if [ -e "${rootmnt}/userdata/system-data/var/lib/ureadahead" ] &&
+			[ -e "${rootmnt}/var/lib/ureadahead" ]
+		then
+			mount --bind \
+				"${rootmnt}/userdata/system-data/var/lib/ureadahead" \
+				"${rootmnt}/var/lib/ureadahead"
+		fi
+
+		#
+		# Setup swap.
+		#
+		[ -e "${rootmnt}/userdata/SWAP.img" ] &&
+			swapon "${rootmnt}/userdata/SWAP.img"
+
+		#
+		# Apply customized user content.
+		#
+		for user in "${rootmnt}/userdata/user-data/"*; do
+			if [ -d "${rootmnt}/custom/home" ] &&
+				[ ! -e "$user/.customized" ]
+			then
+				tell_kmsg "copying custom content tp "
+
+				cp -Rap \
+					"${rootmnt}/custom/home/"* \
+					"$user/"
+
+				cp -Rap \
+					"${rootmnt}/custom/home/".[a-zA-Z0-9]* \
+					"$user/" 2>/dev/null || true
+
+				touch "$user/.customized"
+
+				dstown=$(stat -c "%u:%g" "$user")
+
+				chown -R \
+					"$dstown" \
+					"$user/"
+			fi
+		done
+
+	else
+		#
+		# Possibly a repartitioned device.
+		#
+		halium_panic "Couldn't find a system partition."
+	fi
+
+	[ "$quiet" != "y" ] &&
+		log_begin_msg "Running /scripts/local-bottom"
+
+	run_scripts /scripts/local-bottom
+
+	[ "$quiet" != "y" ] &&
+		log_end_msg
+}
